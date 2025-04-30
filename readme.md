@@ -1,10 +1,11 @@
 # single people detection
 ## download model
 ```
-yolo export model=yolov8n.pt format=onnx
+pip install ultralytics
+yolo export model=yolo11n.pt format=onnx
 ```
 ## run and test
 ```
 cargo run --release
-curl -X POST -F "file=@test.jpg" http://localhost:3030/detect
+curl --data-binary "@grace_hopper.jpg" http://localhost:3030/detect
 ```

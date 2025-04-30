@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, Rgba};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgba};
 use serde::Serialize;
 use std::{convert::Infallible, sync::OnceLock};
 use thiserror::Error;
@@ -13,7 +13,7 @@ fn init_model(
 ) -> &'static RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>> {
     MODEL.get_or_init(|| {
         tract_onnx::onnx()
-            .model_for_path("yolov8n.onnx")
+            .model_for_path("yolo11n.onnx")
             .expect("Failed to load model")
             .into_optimized()
             .expect("Optimization failed")
@@ -21,14 +21,14 @@ fn init_model(
             .expect("Failed to make runnable")
     })
 }
+
 fn preprocess(img: &DynamicImage) -> Result<Tensor, Box<dyn std::error::Error>> {
-    // 调整大小并转换为 RGB
     let img = img.resize_exact(640, 640, FilterType::CatmullRom);
     let rgb_img = img.to_rgb8();
 
     let input = tract_ndarray::Array4::from_shape_fn((1, 3, 640, 640), |(_, c, y, x)| {
         let pixel = rgb_img.get_pixel(x as u32, y as u32);
-        (pixel[c] as f32) / 255.0 // 归一化到 [0,1]
+        (pixel[c] as f32) / 255.0
     });
 
     Ok(Tensor::from(input))
@@ -39,7 +39,7 @@ fn postprocess(
     orig_img: &DynamicImage,
     debug: bool,
 ) -> Result<f32, Box<dyn std::error::Error>> {
-    // YOLOv8 的输出格式为 (1, 84, 8400)
+    // YOLOv11 output is (1, 84, 8400)
     let output = outputs[0].to_array_view::<f32>()?;
     let (orig_w, orig_h) = orig_img.dimensions();
 
@@ -72,8 +72,9 @@ fn postprocess(
                 Rgba([255, 0, 0, 255]),
             );
         }
-        img.save("debug_output.png")?;
+        img.save("debug.png")?;
     }
+    println!("Detections: {:?}", detections); // Debug informatio
 
     let prob = match detections.len() {
         0 => 0.0,
@@ -84,23 +85,17 @@ fn postprocess(
 }
 
 async fn detect_handler(data: bytes::Bytes) -> Result<impl Reply, Rejection> {
-    // 验证图片格式
-    // let format = ImageFormat::from_mime_type(&data)
-    //     .map_err(|_| warp::reject::custom(ApiError::InvalidImageFormat))?;
-
-    // if !matches!(format, ImageFormat::Jpeg | ImageFormat::Png) {
-    //     return Err(warp::reject::custom(ApiError::InvalidImageFormat));
-    // }
-
-    let img = image::load_from_memory(&data)
-        .map_err(|_| warp::reject::custom(ApiError::ImageDecodeFailure))?;
+    let img = image::load_from_memory(&data).map_err(|e| {
+        println!("Error loading image: {:?}", e);
+        warp::reject::custom(ApiError::ImageDecodeFailure)
+    })?;
     let input = preprocess(&img).map_err(|_| warp::reject::reject())?;
     let outputs = MODEL
         .get()
         .expect("bad model")
         .run(tvec!(input.to_owned().into()))
         .map_err(|_| warp::reject::reject())?;
-    let debug_mode = cfg!(debug_assertions); // 调试模式自动开启
+    let debug_mode = cfg!(debug_assertions);
     let prob = postprocess(&outputs, &img, debug_mode).map_err(|_| warp::reject::reject())?;
 
     #[derive(Serialize)]
