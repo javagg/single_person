@@ -1,29 +1,39 @@
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgba};
 use serde::Serialize;
-use std::{convert::Infallible, sync::OnceLock};
+use std::convert::Infallible;
+use std::sync::LazyLock;
 use thiserror::Error;
 use tract_onnx::prelude::*;
 use warp::{Filter, Rejection, Reply};
+// use anyhow::Result;
 
-static MODEL: OnceLock<
-    RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
-> = OnceLock::new();
+const TARGET_CLASSES: [usize; 3] = [0, 2, 5]; 
 
-fn init_model(
-) -> &'static RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>> {
-    MODEL.get_or_init(|| {
-        tract_onnx::onnx()
-            .model_for_path("yolo11n.onnx")
-            .expect("Failed to load model")
-            .into_optimized()
-            .expect("Optimization failed")
-            .into_runnable()
-            .expect("Failed to make runnable")
-    })
+#[derive(Debug)]
+struct Detection {
+    class_id: usize,
+    confidence: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
 }
 
-fn preprocess(img: &DynamicImage) -> Result<Tensor, Box<dyn std::error::Error>> {
-    let img = img.resize_exact(640, 640, FilterType::CatmullRom);
+static MODEL: LazyLock<
+    RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+> = LazyLock::new(|| {
+    let opts = PlanOptions::default();
+    tract_onnx::onnx()
+        .model_for_path("yolo11n.onnx")
+        .expect("Failed to load model")
+        .into_optimized()
+        .expect("Optimization failed")
+        .into_runnable_with_options(&opts)
+        .expect("Failed to make runnable")
+});
+
+fn preprocess(img: &DynamicImage, w: u32, h: u32) -> anyhow::Result<Tensor> {
+    let img = img.resize_exact(w, h, FilterType::Lanczos3);
     let rgb_img = img.to_rgb8();
 
     let input = tract_ndarray::Array4::from_shape_fn((1, 3, 640, 640), |(_, c, y, x)| {
@@ -38,29 +48,42 @@ fn postprocess(
     outputs: &TVec<TValue>,
     orig_img: &DynamicImage,
     debug: bool,
-) -> Result<f32, Box<dyn std::error::Error>> {
+) -> anyhow::Result<f32> {
     // YOLOv11 output is (1, 84, 8400)
     let output = outputs[0].to_array_view::<f32>()?;
     let (orig_w, orig_h) = orig_img.dimensions();
 
     let mut detections = Vec::new();
     for i in 0..output.shape()[2] {
+        let class_id = output[[0, 5, i]] as usize;
         let confidence = output[[0, 4, i]]; // 置信度在索引4
-        if confidence < 0.5 {
+        if !TARGET_CLASSES.contains(&class_id) || confidence < 0.5 {
             continue;
-        } // 置信度阈值
+        }
 
         let x = output[[0, 0, i]] * orig_w as f32 / 640.0;
         let y = output[[0, 1, i]] * orig_h as f32 / 640.0;
         let w = output[[0, 2, i]] * orig_w as f32 / 640.0;
         let h = output[[0, 3, i]] * orig_h as f32 / 640.0;
 
-        detections.push((x, y, w, h, confidence));
+        detections.push(Detection {
+            class_id,
+            confidence,
+            x,
+            y,
+            w,
+            h,
+        });
     }
 
     if debug {
         let mut img = orig_img.to_rgba8();
-        for (x, y, w, h, _) in &detections {
+        for det in &detections {
+            let x = det.x;
+            let y = det.y;
+            let w = det.w;
+            let h = det.h;
+
             let x1 = (x - w / 2.0) as i32;
             let y1 = (y - h / 2.0) as i32;
             let x2 = (x + w / 2.0) as i32;
@@ -71,6 +94,24 @@ fn postprocess(
                 imageproc::rect::Rect::at(x1, y1).of_size((x2 - x1) as u32, (y2 - y1) as u32),
                 Rgba([255, 0, 0, 255]),
             );
+            // let text = format!("ID: {}", det.class_id);
+            // let font = FontRef::try_from_slice(include_bytes!("DejaVuSans.ttf")).unwrap();
+            // let scale = PxScale {
+            //     x: height * 2.0,
+            //     y: height,
+            // };
+            // imageproc::drawing::draw_text(
+            //     &img,
+            //     Rgba([255, 0, 0, 255]),
+            //     x,
+            //     y, scale,
+            //     imageproc:tex: FONT_HERSHEY_SIMPLEX,
+            //     text,
+            //     // Rgba([255, 0, 0, 255]),
+            //     // 2,
+            //     // core::LINE_8,
+            //     // false,
+            // );
         }
         img.save("debug.png")?;
     }
@@ -89,10 +130,8 @@ async fn detect_handler(data: bytes::Bytes) -> Result<impl Reply, Rejection> {
         println!("Error loading image: {:?}", e);
         warp::reject::custom(ApiError::ImageDecodeFailure)
     })?;
-    let input = preprocess(&img).map_err(|_| warp::reject::reject())?;
+    let input = preprocess(&img, 640, 640).map_err(|_| warp::reject::reject())?;
     let outputs = MODEL
-        .get()
-        .expect("bad model")
         .run(tvec!(input.to_owned().into()))
         .map_err(|_| warp::reject::reject())?;
     let debug_mode = cfg!(debug_assertions);
@@ -152,8 +191,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
 
 #[tokio::main]
 async fn main() {
-    init_model();
-
+    LazyLock::force(&MODEL);
     let detect_route = warp::post()
         .and(warp::path("detect"))
         .and(warp::body::bytes())
